@@ -1,0 +1,149 @@
+---
+title: ""
+author: "Xinyi Yan"
+date: "3/7/2021"
+output: html_document
+---
+```{r}
+library(dplyr)
+library(spdep)
+library(INLA)
+library(knitr)
+library(SpatialEpi)
+library(MASS)
+library(maps)
+library(RColorBrewer)
+library(maptools)
+library(rgdal)
+library(scales)
+library(dplyr)
+library(classInt)
+library(geoR)
+library(fields)
+library(rgeos)
+library(ggplot2)
+library(ggrepel)
+```
+
+only analyze 2017
+```{r}
+Crime_Data_2010_2017 <- read.csv("~/Downloads/Crime_Data_2010_2017.csv")
+
+Crime_Data_2010_2017$Date <- as.Date(Crime_Data_2010_2017$Date.Occurred, '%d/%m/%Y')
+crime<-filter(Crime_Data_2010_2017, format(Crime_Data_2010_2017$Date, '%Y') == "2017")
+
+
+
+group <- crime %>%
+  group_by(Crime.Code.Description) %>%
+  summarise(total = n()) %>%
+  distinct() %>%
+  top_n(10)
+
+group %>%
+  ggplot(aes(reorder(Crime.Code.Description, total), y = total)) +
+  geom_col(fill = "goldenrod2") +
+  geom_label_repel(aes(label = total), size = 2.5) +
+  coord_flip() +
+  labs(title = "Top 10 Crime Recorded in 2017", 
+       x = "Crime Description", 
+       y = "Total")
+
+crime_sex<-crime[crime$Victim.Sex=="F"|crime$Victim.Sex=="M",]
+
+ggplot(crime_sex, aes(x=Victim.Age, color=Victim.Sex)) +
+  geom_histogram(fill="white")+
+  labs(x = 'Victim Age', y = 'Count of Crimes', 
+       title = 'Victim age and sex') +
+  theme_bw()
+```
+
+```{r}
+head(crime)
+
+la_district<-rgdal::readOGR(dsn = '/Users/xinyiyan/Desktop/spatial',layer = 'LAPD_Reporting_Districts')
+plot(la_district)
+
+head(crime$Location)
+latlong<-gsub('\\(','',crime$Location)
+latlong<-gsub('\\)','',latlong)
+latlong = stringr::str_split(latlong,",")
+latlong = as.data.frame(do.call(rbind,latlong))
+colnames(latlong) = c("latitude","longitude")
+
+crime$latitude<-latlong$latitude
+crime$longitude<-latlong$longitude
+
+crime_comp<-crime[!is.na(crime$Crime.Code.Description),]
+
+
+```
+
+```{r}
+rob<-sum(crime_comp$Crime.Code.Description=='ROBBERY')
+prob<-rob/nrow(crime_comp)
+crime_dist<- crime_comp %>% group_by(Reporting.District) %>%
+  summarise(rob = sum(Crime.Code.Description=='ROBBERY'),
+            popn =n(),
+            expected = prob*n()
+            ) %>%
+  mutate(SMR = rob/expected)
+
+
+
+
+la_district2<-la_district
+la_district2@data<-sp::merge(la_district2@data,crime_dist,by.x = "REPDIST", by.y = "Reporting.District", all.x = TRUE)
+
+
+
+spplot(la_district2,zcol='rob',col.regions=brewer.pal(9,'Oranges'),cuts=8,main='Observed robberies')
+spplot(la_district2,zcol='SMR',col.regions=brewer.pal(9,'Oranges'),cuts=8,main='Standardized Mortality Ratios(SMRs)')
+
+dat2<-la_district2@data
+
+
+quasipmod<-glm(rob~1,offset=log(expected),data=dat2,family = quasipoisson())
+
+res1<-residuals(quasipmod,type='pearson')
+
+
+
+la_district3<-la_district
+la_district3@data$REPDIST
+
+
+
+dat4<-subset(dat2,!is.na(dat2$rob))
+dat5<-subset(la_district3,la_district3$REPDIST %in% dat4$REPDIST)
+dat5$res<-res1
+spplot(dat5,'res')
+la_neighbors<-poly2nb(dat5)
+neighbors.W <- nb2listw(la_neighbors,style="W", zero.policy=TRUE)
+neighbors.B <- nb2listw(la_neighbors,style="B", zero.policy=TRUE)
+
+moran.test(res1,neighbors.W)
+moran.test(res1,neighbors.B)
+
+geary.test(res1,neighbors.W)
+geary.test(res1,neighbors.B)
+```
+
+```{r}
+
+
+geo1<-gCentroid(dat5,
+                byid=TRUE,
+                id=dat5@data$REPDIST)
+
+
+Kpoisson<-kulldorff(geo1@coords,cases = dat4$rob,population = dat4$popn,expected.cases = dat4$expected,pop.upper.bound = 0.1,
+                    n.simulations = 100,alpha.level = 0.05)
+kcluster<-Kpoisson$most.likely.cluster$location.IDs.included
+
+dat5$mlc<-ifelse(dat5$REPDIST %in% kcluster,1,2)
+dat5$mlc<-factor(dat5$mlc,levels = 1:2,c('most likely cluster','rest of LA'))
+cluster.color<-c('firebrick','goldenrod2')
+spplot(dat5['mlc'],col.regions=cluster.color,main='Most likely spatial cluster')
+```
+
